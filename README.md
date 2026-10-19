@@ -1,11 +1,14 @@
 # Kubernetes Runtime Security & Incident Response Lab
 
+[![CI](https://github.com/Gianmarco-Fabbri/Kubernetes-Incident-Response/actions/workflows/ci.yml/badge.svg)](https://github.com/Gianmarco-Fabbri/Kubernetes-Incident-Response/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 An academic lab for Kubernetes runtime detection and automated incident response,
 combining Falco, Falcosidekick, a Python handler and Cilium network policies.
 The Flask target is intentionally vulnerable. Never expose it to an untrusted network.
 This is not a production controller or a forensic acquisition tool.
 
-- [Laboratory handbook](Kubernetes_Runtime_Security_Guide.pdf)
+- [Technical report (PDF)](Kubernetes_Runtime_Security_Guide.pdf)
 - [Validation and integration checklist](#validation-status)
 
 ## Architecture
@@ -25,7 +28,7 @@ Falco syscall event -> HTTP -> Falcosidekick -> authenticated HTTP -> Python han
 | `material/manifests/` | Vulnerable workload, Service, PDB and Cilium quarantine policy |
 | `material/vulnapp/` | Deliberately vulnerable Flask target and container build |
 | `material/payloads/ptrace.c` | Inspectable Linux anti-debugging demonstration |
-| `report/` | LaTeX handbook sources, attribution and compiled PDF |
+| `report/` | LaTeX sources of the technical report (compiled copy at repository root) |
 | `.github/workflows/ci.yml` | Unit tests, YAML parsing and container build checks |
 
 ## Behaviour and limits
@@ -136,12 +139,15 @@ PYTHONPATH=material/falco_handler/src .venv/bin/python -m unittest discover \
 
 ## Validation status
 
-Checks executed locally on 19 September 2026 (not a claim of a remote CI run):
+[GitHub Actions](.github/workflows/ci.yml) runs on every push and pull request:
+handler unit tests (Python 3.11, on the runner and inside the non-root, read-only,
+network-less handler image), Python compilation, YAML parsing of all manifests and
+both container builds.
+
+The following checks were executed manually on 19 September 2026:
 
 | Check | Result |
 |---|---|
-| Handler regression suite | 16 tests passed in Python 3.11, non-root, read-only container with no network |
-| Container builds | Handler and target built successfully |
 | Target smoke test | Form GET and loopback ping POST passed without external network access |
 | Helm rendering | Chart 9.1.0 rendered; webhook header and policy selector labels checked |
 | Kubernetes standard manifests | Server-side dry-run passed on Kubernetes v1.35.6+orb1; no resources created |

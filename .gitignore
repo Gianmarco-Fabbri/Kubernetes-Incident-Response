@@ -45,3 +45,6 @@ material/payloads/ptrace
 
 # Documentation
 docs/
+
+# Compiled report (published copy lives at the repository root)
+report/main.pdf
