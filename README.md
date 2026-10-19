@@ -3,72 +3,96 @@
 [![CI](https://github.com/Gianmarco-Fabbri/Kubernetes-Incident-Response/actions/workflows/ci.yml/badge.svg)](https://github.com/Gianmarco-Fabbri/Kubernetes-Incident-Response/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-An academic lab for Kubernetes runtime detection and automated incident response,
-combining Falco, Falcosidekick, a Python handler and Cilium network policies.
-The Flask target is intentionally vulnerable. Never expose it to an untrusted network.
-This is not a production controller or a forensic acquisition tool.
+A hands-on lab that detects malicious activity inside a Kubernetes pod at runtime and
+responds automatically: the compromised pod is cut off from the network and from its
+Service, kept alive for investigation, and replaced by a healthy replica.
 
-- [Technical report (PDF)](Kubernetes_Runtime_Security_Guide.pdf)
-- [Validation and integration checklist](#validation-status)
+It combines [Falco](https://falco.org/) for syscall-level detection,
+[Falcosidekick](https://github.com/falcosecurity/falcosidekick) for alert forwarding,
+a small Python response handler and [Cilium](https://cilium.io/) network policies.
+The project started as a university assignment at Politecnico di Torino and has been
+extended since ([project history](#project-history)).
 
-## Architecture
+> [!WARNING]
+> The Flask target is **intentionally vulnerable** to command injection. Run the lab
+> only on a disposable cluster and never expose it to an untrusted network. This is a
+> learning environment, not a production controller or a forensic acquisition tool.
 
-```text
-Falco syscall event -> HTTP -> Falcosidekick -> authenticated HTTP -> Python handler
-  -> validate event and target -> patch pod labels
-  -> Cilium network deny + Service detachment + ReplicaSet replacement
+📄 **[Technical report (PDF)](Kubernetes_Runtime_Security_Guide.pdf)**: design,
+deployment and detection scenarios in detail.
+
+## Why
+
+Once an attacker gets code execution in a container they can open a reverse shell,
+read the ServiceAccount token or run evasive payloads. Detecting this is only half of
+the job: deleting the pod immediately interrupts the service and destroys volatile
+evidence, while leaving it running lets the attack continue. This lab explores a
+middle ground: **isolate, preserve, replace**.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[vulnapp pod] -- syscalls --> F[Falco]
+    F -- alert --> S[Falcosidekick]
+    S -- authenticated webhook --> H[Python handler]
+    H -- label patch --> K[Kubernetes API]
+    K --> C[Cilium: deny all traffic<br/>to tainted pod]
+    K --> R[ReplicaSet: start<br/>replacement pod]
+    K --> E[Service: drop pod<br/>from endpoints]
 ```
 
-### Repository map
+1. Falco matches a suspicious syscall pattern in the `vulnapp` container.
+2. Falcosidekick forwards the alert to the handler with a shared token.
+3. The handler validates the rule, namespace and target, then patches the pod labels:
+   it removes the selector labels (`app`, `pod-template-hash`) and adds
+   `tainted-by-falco=true`, a manager label and a UTC quarantine timestamp.
+4. Kubernetes and Cilium react to the new labels:
+   - the Service stops routing traffic to the pod;
+   - the ReplicaSet no longer owns it and starts a fresh replica;
+   - a `CiliumNetworkPolicy` denies all ingress and egress for the tainted pod.
 
-| Path | Purpose |
+### Detection rules
+
+| Falco rule | Scenario |
 |---|---|
-| `material/falco/` | Falco values, custom rule and Falcosidekick ingress restriction |
-| `material/falco_handler/` | Response service, scoped RBAC, hardening and unit tests |
-| `material/manifests/` | Vulnerable workload, Service, PDB and Cilium quarantine policy |
-| `material/vulnapp/` | Deliberately vulnerable Flask target and container build |
-| `material/payloads/ptrace.c` | Inspectable Linux anti-debugging demonstration |
-| `report/` | LaTeX sources of the technical report (compiled copy at repository root) |
-| `.github/workflows/ci.yml` | Unit tests, YAML parsing and container build checks |
+| `Redirect STDOUT/STDIN to Network Connection in Container` | Reverse shell via command injection |
+| `PTRACE anti-debug attempt` | Anti-debugging payload ([`ptrace.c`](material/payloads/ptrace.c)) |
+| `Detect Network Tools in vulnapp` | Custom rule: `curl`, `wget`, `nc`… executed in the target |
 
-## Behaviour and limits
+The report also covers reading the ServiceAccount token as an exposure exercise. It is
+not a detection guaranteed by this ruleset.
 
-The handler accepts only three named syscall rules and pods in `default` with
-`app=vulnapp`. It removes only selector labels, adds a manager label and UTC quarantine
-timestamp, and uses `resourceVersion` to detect stale patches. The exact reverse-shell
-rule is `Redirect STDOUT/STDIN to Network Connection in Container`.
+## Repository layout
 
-An explicit Cilium ingress/egress deny selects `tainted-by-falco=true`. Label acceptance
-does not prove network enforcement: Cilium, EndpointSlices and ReplicaSets reconcile
-asynchronously. Two replicas reduce disruption during a single incident; neither they
-nor the eviction PDB guarantee zero downtime. No liveness probe deliberately restarts
-the quarantined target, but OOM/node failure can still destroy volatile evidence.
+| Path | Contents |
+|---|---|
+| [`material/falco/`](material/falco) | Falco Helm values, custom rule, Falcosidekick ingress policy |
+| [`material/falco_handler/`](material/falco_handler) | Response handler, scoped RBAC, network policy, unit tests |
+| [`material/manifests/`](material/manifests) | Target Deployment, Service, PDB and Cilium quarantine policy |
+| [`material/vulnapp/`](material/vulnapp) | Deliberately vulnerable Flask target |
+| [`material/payloads/`](material/payloads) | Linux `ptrace` anti-debugging demonstration |
+| [`report/`](report) | LaTeX sources of the technical report |
 
-`MAX_QUARANTINED_PODS=3` is a soft retention target. Automatic cleanup only considers
-older pods marked `security-lab/managed-by=falco-handler` with a valid quarantine time
-and an operator assertion `security-lab/evidence-exported=true`. After actually
-collecting and verifying evidence, mark a specific pod using `kubectl annotate pod`.
-Unexported and legacy evidence is retained, so monitor resource use. Deletion has UID
-and resourceVersion preconditions and a 30-second grace period. Cleanup runs on new
-or repeated accepted events, not periodically. Failures return non-2xx for retry;
-there is no durable queue or guaranteed delivery.
+## Quickstart
 
-One Gunicorn process serializes responses with a lock; spare threads serve probes.
-Concurrent responses get 503 and require retry. Recreate avoids intended rollout
-overlap but interrupts service during upgrades. Do not scale without coordination.
+### Requirements
 
-## Environment
+- A **disposable** Linux Kubernetes cluster with Cilium as CNI. Do not swap the CNI of
+  an existing cluster. The original lab used Cilium 1.15.14; pick a currently supported
+  version for new installations and record it.
+- Kernel with BTF support (Falco runs with the modern eBPF driver).
+- `kubectl`, `helm`, `docker` and `openssl` on the lab host.
+- Pinned versions: Falco chart **9.1.0** / Falco **0.44.1**. Direct Python
+  dependencies are pinned too; image layers and transitive packages are not locked.
 
-Use a disposable Linux Kubernetes cluster with a compatible Cilium installation.
-Do not replace the CNI of an existing cluster blindly. The historical lab used Cilium
-1.15.14; select a supported version pair for new installations and record it.
-Current values target Falco chart **9.1.0 / Falco 0.44.1**, with modern eBPF and kernel
-BTF support. The old CrownLabs kmod setup is historical, not the current quickstart.
-Chart and direct Python dependencies are pinned; image layers and transitive packages
-are not fully locked, so bit-for-bit reproducibility is not claimed.
+Run all commands from the repository root. The image import below targets a
+single-node containerd cluster; adapt it for kind or other runtimes. Build the
+`ptrace` payload on Linux, not macOS.
 
-Run from repository root on the Linux lab host. Image import below targets single-node
-containerd; adapt to kind/other runtimes. Build the ptrace binary on Linux, not macOS.
+### 1. Deploy the target and the quarantine policy
+
+Install the isolation policy **before** enabling the response.
 
 ```bash
 kubectl config current-context
@@ -82,7 +106,10 @@ kubectl apply -f material/manifests/vulnapp-pdb.yaml
 kubectl -n default rollout status deployment/vulnapp
 ```
 
-Install isolation BEFORE enabling response. Then run in one shell:
+### 2. Deploy the handler and Falco
+
+Run this block in a single shell, so the token is shared between the handler Secret and
+the Falco values:
 
 ```bash
 export FALCO_WEBHOOK_TOKEN="$(openssl rand -hex 32)"
@@ -111,24 +138,17 @@ helm repo update
 unset FALCO_WEBHOOK_TOKEN
 ```
 
-Review local overrides before `--reset-values`; this avoids duplicate custom rules
-from the old guide. Changing the token requires restarting the handler: Secret-backed
-environment variables do not refresh automatically. Helm stores values in release
-metadata; restrict access to those Secrets. HTTP/shared tokens are lab controls, not
-TLS/mTLS. The upstream ingress policy admits only Falco pods in the same namespace
-to Falcosidekick; keep `hostNetwork: false`. Administrators, node access, pod-label
-permissions and other additive allow policies remain part of the trust boundary.
+Notes:
 
-## Migration
+- `--reset-values` drops previous overrides, avoiding duplicate custom rules from
+  older installs. Review any local overrides first.
+- After changing the token, restart the handler: environment variables from a Secret
+  are not refreshed automatically.
+- Helm stores the values, token included, in release Secrets. Restrict access to them.
 
-Applying a Role does not remove the old ClusterRoleBinding. Inspect
-`falco-handler-pod-binding` / `falco-pod-manager` and, for the university version,
-`falco-handler-deployment-binding` / `falco-deployment-manager`. Remove the old
-cluster-scoped bindings/roles only after confirming ownership and other consumers.
-Verify the handler cannot patch pods outside `default`. Legacy quarantines without
-manager metadata are deliberately not adopted automatically.
+## Testing
 
-## Tests
+Unit tests for the handler:
 
 ```bash
 python3 -m venv .venv
@@ -151,9 +171,10 @@ The following checks were executed manually on 19 September 2026:
 | Target smoke test | Form GET and loopback ping POST passed without external network access |
 | Helm rendering | Chart 9.1.0 rendered; webhook header and policy selector labels checked |
 | Kubernetes standard manifests | Server-side dry-run passed on Kubernetes v1.35.6+orb1; no resources created |
-| Cilium isolation / complete Falco response chain | **Not validated end-to-end in this environment** |
+| Cilium isolation / complete Falco response chain | **Not yet validated end-to-end** |
 
-Before claiming an end-to-end result, test on a disposable Cilium cluster:
+<details>
+<summary>End-to-end checklist for a disposable Cilium cluster</summary>
 
 1. Record Kubernetes, kernel, runtime, chart, ruleset and image versions. Check that
    Falco starts without duplicate rules and emits pod/namespace fields.
@@ -168,16 +189,81 @@ Before claiming an end-to-end result, test on a disposable Cilium cluster:
    unrelated or unexported evidence. Check behaviour during bursts and handler upgrades.
 
 A failed internet ping alone does not demonstrate bidirectional containment.
-Reading the ServiceAccount token is an exposure exercise, not a detection guaranteed
-by this ruleset. The deliberate `shell=True` injection must remain in the lab target.
 
-## Provenance and licenses
+</details>
 
-Gianmarco Fabbri, M.Sc. student in Cybersecurity Engineering, Politecnico di Torino.
-The presentation on 9 September 2026 preceded the afternoon changes; its Git reference
-is `9ec6471`, subject to any uncommitted submission differences. Later work extends
-the original lab and must not be attributed retrospectively to the submitted version.
+## Design notes and limitations
 
-The root LICENSE contains MIT terms. The report carries CC BY-NC-SA 3.0 and credits
-Francesco Pizzato, Alex Palesandro, Marco Iorio and Stefano Galantino. Preserve those
-notices; the root license does not relicense third-party teaching material.
+**Scope.** The handler only acts on the three rules above, for pods in `default`
+labelled `app=vulnapp`. Its Role is namespaced, and patches use `resourceVersion` to
+detect stale writes.
+
+**Asynchronous enforcement.** A successful label patch does not by itself prove that
+traffic is blocked: Cilium, EndpointSlices and ReplicaSets reconcile asynchronously.
+Two replicas and a PDB reduce disruption during an incident but do not guarantee zero
+downtime.
+
+**Evidence retention.** Quarantined pods are kept alive, and the target has no
+liveness probe so it is not restarted. An OOM kill or node failure can still destroy
+volatile evidence. `MAX_QUARANTINED_PODS=3` is a soft limit. Cleanup only deletes
+older pods that the handler manages and that an operator has marked as exported,
+after actually collecting and verifying the evidence:
+
+```bash
+kubectl annotate pod <pod> security-lab/evidence-exported=true
+```
+
+Deletions use UID and `resourceVersion` preconditions and a 30-second grace period.
+Cleanup runs when new events arrive, not periodically, and unexported pods are never
+deleted, so keep an eye on resource usage.
+
+**Delivery.** Failed responses return non-2xx so Falcosidekick can retry, but there
+is no durable queue. A single Gunicorn process handles responses one at a time;
+concurrent ones get `503` and must be retried. The Deployment uses the `Recreate`
+strategy, so upgrades briefly interrupt the handler. Do not scale it horizontally.
+
+**Trust boundary.** The webhook uses a shared token over plain HTTP, which is a
+lab-grade control, not TLS/mTLS. Falcosidekick only accepts traffic from Falco pods in
+its namespace (keep `hostNetwork: false`). Cluster administrators, node access and
+anyone who can edit pod labels or add allow policies remain trusted.
+
+**The vulnerability is the point.** The `shell=True` command injection in `vulnapp`
+is deliberate and must stay in the lab target.
+
+## Project history
+
+The version presented at Politecnico di Torino on 9 September 2026 is tagged
+[`v1.0-submission`](../../tree/v1.0-submission). It used a `kubectl`-based handler,
+a zipapp target with seccomp profiles and the original packaged payloads. Work done
+after the presentation should not be attributed to the submitted version. It
+includes:
+
+- a new Flask target and the `ptrace` anti-debugging payload source;
+- a handler built on the Kubernetes Python client, with label-based detachment;
+- Cilium quarantine policy, PDB and a two-replica target;
+- authenticated webhook, namespaced RBAC, evidence retention rules and network
+  policies for Falcosidekick and the handler;
+- unit tests, CI and an updated technical report.
+
+<details>
+<summary>Upgrading from the submitted version</summary>
+
+Applying the new Role does not remove the old cluster-wide bindings. Inspect
+`falco-handler-pod-binding` / `falco-pod-manager` and
+`falco-handler-deployment-binding` / `falco-deployment-manager`, and remove them only
+after confirming nothing else uses them. Verify that the handler cannot patch pods
+outside `default`. Pods quarantined by the old handler have no manager metadata and
+are deliberately not adopted or cleaned up automatically.
+
+</details>
+
+## Credits and licenses
+
+Developed by **Gianmarco Fabbri** (M.Sc. Cybersecurity Engineering, Politecnico di
+Torino).
+
+The code is released under the [MIT License](LICENSE). The technical report is
+licensed under CC BY-NC-SA 3.0 and builds on laboratory material created by
+Francesco Pizzato, with enhancements by Alex Palesandro, Marco Iorio and Stefano
+Galantino. Keep those notices: the MIT license does not relicense third-party
+teaching material.
