@@ -15,8 +15,10 @@ extended since ([project history](#project-history)).
 
 > [!WARNING]
 > The Flask target is **intentionally vulnerable** to command injection. Run the lab
-> only on a disposable cluster and never expose it to an untrusted network. This is a
-> learning environment, not a production controller or a forensic acquisition tool.
+> only on a disposable cluster and never expose it to an untrusted network. The target
+> Service is a NodePort (`32080`) reachable on every node address: firewall the nodes
+> so that only the lab host can reach it. This is a learning environment, not a
+> production controller or a forensic acquisition tool.
 
 📄 **[Technical report (PDF)](Kubernetes_Runtime_Security_Guide.pdf)**: design,
 deployment and detection scenarios in detail.
@@ -217,10 +219,21 @@ Deletions use UID and `resourceVersion` preconditions and a 30-second grace peri
 Cleanup runs when new events arrive, not periodically, and unexported pods are never
 deleted, so keep an eye on resource usage.
 
-**Delivery.** Failed responses return non-2xx so Falcosidekick can retry, but there
-is no durable queue. A single Gunicorn process handles responses one at a time;
-concurrent ones get `503` and must be retried. The Deployment uses the `Recreate`
-strategy, so upgrades briefly interrupt the handler. Do not scale it horizontally.
+**Delivery.** Falcosidekick sends each alert once and never retries, so the handler
+absorbs transient problems itself:
+
+- concurrent alerts wait up to `LOCK_WAIT_SECONDS` (default 10 s) for their turn;
+- Kubernetes API conflicts (409), throttling (429), server errors and timeouts are
+  retried up to three times with backoff, re-reading the pod before each patch;
+- a target pod that no longer exists is reported as `gone`;
+- if cleanup of old evidence fails after a successful quarantine, the response is
+  still 200 with `cleanup: pending`, and the next accepted event retries it.
+
+An alert is lost only when the wait or the retries run out: the handler logs it at
+error level and returns 503 or 502. There is no durable queue. A single Gunicorn
+process handles one response at a time, with spare threads for the probes. The
+Deployment uses the `Recreate` strategy, so upgrades briefly interrupt the handler.
+Do not scale it horizontally.
 
 **Trust boundary.** The webhook uses a shared token over plain HTTP, which is a
 lab-grade control, not TLS/mTLS. Falcosidekick only accepts traffic from Falco pods in

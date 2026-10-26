@@ -76,12 +76,19 @@ kubectl -n default annotate pod <quarantined-pod> \
 Deletion uses UID and resourceVersion preconditions and a grace period. Ordering is
 by incident time, not pod creation time. Duplicate events reattempt cleanup without
 replacing the original quarantine timestamp. There is no periodic cleanup controller.
-API errors and cleanup failures return non-success status for retry; there is no
-durable queue or guaranteed replay.
+A cleanup failure does not undo a successful quarantine: the response is still
+successful, marks cleanup as pending, and the next accepted event retries it.
 
-One process serializes response operations using a lock; other threads can serve
-probes. Concurrent events receive 503. Recreate prevents intended rollout overlap
-but causes an update interruption. Distributed scaling requires additional design.
+Falcosidekick sends each alert once and does not retry failed deliveries, so the
+handler absorbs transient failures itself. Kubernetes API conflicts, throttling,
+server errors and timeouts are retried up to three times with backoff, and each
+attempt re-reads the pod before patching it. A target pod that no longer exists is
+reported as gone. One process serializes response operations using a lock; concurrent
+events wait up to a configurable time (ten seconds by default) while other threads
+keep serving probes. An alert is lost only if that wait or the retries are exhausted,
+in which case the handler logs an error; there is no durable queue or guaranteed
+replay. Recreate prevents intended rollout overlap but causes an update interruption.
+Distributed scaling requires additional design.
 The target has no liveness probe that intentionally restarts isolated evidence, but
 OOM and node failures can still destroy volatile state.
 
@@ -89,8 +96,8 @@ OOM and node failures can still destroy volatile state.
 
 The following checks were completed for the current implementation:
 \begin{itemize}
-\item Sixteen handler regression tests passed in a hardened Python 3.11 container,
-running non-root with a read-only filesystem and no network access.
+\item Twenty-two handler regression tests pass in a hardened Python 3.11 container,
+running non-root with a read-only filesystem and no network access, on every push.
 \item Both container images built successfully; the target form and a loopback ping
 request passed a basic smoke test.
 \item Helm chart 9.1.0 rendered successfully; the webhook header and policy-selector
@@ -109,3 +116,29 @@ identified compromised pods. Do not remove the isolation policy while compromise
 pods remain running. Detached pods may outlive their Deployment; deleting the
 Deployment alone is not a complete cleanup. Remove only project-owned resources and
 verify the selected Kubernetes context before executing destructive commands.
+
+\section{Results and future work}
+The project connects runtime detection to an automated, conservative response.
+A compromised target is removed from its Service, replaced by its ReplicaSet and
+labelled for network quarantine, while it is kept running for investigation. The
+handler accepts only authenticated events for an explicit set of rules, namespace
+and workload; it detects conflicting writes, retries transient API failures and
+never deletes evidence that an operator has not marked as exported.
+
+The main limitations are delivery and trust. Alerts are not persisted, so a handler
+outage loses them; the webhook token travels over plain HTTP inside the cluster;
+and administrators, node access and label editors remain trusted. The handler does
+not acquire memory or export evidence, and containment must still be measured on a
+real Cilium cluster rather than inferred from accepted label changes.
+
+Natural extensions follow from these limits:
+\begin{itemize}
+\item durable delivery, for example by routing Falcosidekick to a message queue
+such as NATS or Kafka that the handler consumes and acknowledges;
+\item transport authentication with TLS or mutual TLS between Falcosidekick and
+the handler;
+\item evidence acquisition before or right after isolation, for example through
+the kubelet container checkpoint API, with the result recorded on the pod;
+\item an automated end-to-end test on a disposable cluster that exercises each
+detection scenario and verifies bidirectional network deny.
+\end{itemize}

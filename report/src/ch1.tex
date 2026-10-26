@@ -15,7 +15,36 @@ network policy has already been enforced.
 
 \section{Architecture}
 The implementation separates event detection, event forwarding, response decisions
-and network enforcement:
+and network enforcement (Figure~\ref{fig:architecture}):
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=6mm and 13mm,
+  box/.style={draw, rounded corners=2pt, align=center, font=\footnotesize,
+    minimum height=9mm, text width=20mm, fill=blue!4},
+  effect/.style={box, fill=gray!8, text width=28mm},
+  arrow/.style={-{Latex[length=2mm]}, semithick},
+  lbl/.style={font=\scriptsize, midway, above}]
+\node[box] (pod) {\texttt{vulnapp}\\pod};
+\node[box, right=of pod] (falco) {Falco\\(eBPF)};
+\node[box, right=of falco] (sidekick) {Falcosidekick};
+\node[box, right=of sidekick] (handler) {Python\\handler};
+\node[box, below=10mm of handler] (api) {Kubernetes\\API server};
+\node[effect, below=10mm of api] (rs) {ReplicaSet starts\\a replacement};
+\node[effect, left=5mm of rs] (svc) {Service drops\\the pod's endpoint};
+\node[effect, right=5mm of rs] (cilium) {Cilium denies\\all pod traffic};
+\draw[arrow] (pod) -- node[lbl] {syscalls} (falco);
+\draw[arrow] (falco) -- node[lbl] {alert} (sidekick);
+\draw[arrow] (sidekick) -- node[lbl] {token} (handler);
+\draw[arrow] (handler) -- node[font=\scriptsize, right] {label patch} (api);
+\draw[arrow] (api) -- (svc);
+\draw[arrow] (api) -- (rs);
+\draw[arrow] (api) -- (cilium);
+\end{tikzpicture}
+\caption{Detection and response flow. The handler only changes pod labels;
+Kubernetes controllers and Cilium react to them asynchronously.}
+\label{fig:architecture}
+\end{figure}
 \begin{enumerate}
 \item \textbf{Falco} evaluates syscall events against runtime-security rules.
 \item \textbf{Falcosidekick} receives alerts over HTTP and forwards selected events
@@ -45,8 +74,8 @@ reconciliation and failure recovery must be measured in the deployment environme
 
 \section{Implementation and verification status}
 The response handler, deployment hardening, network-policy manifests and automated
-tests are implemented. Sixteen regression tests passed in the Python 3.11 handler
-image under non-root, read-only and network-disabled execution. Both container
+tests are implemented. Twenty-two regression tests run on every push in the Python
+3.11 handler image under non-root, read-only and network-disabled execution. Both container
 images were built, Helm output was inspected, and standard Kubernetes manifests
 passed server-side dry-run validation.
 

