@@ -48,3 +48,6 @@ docs/
 
 # Compiled report (published copy lives at the repository root)
 report/main.pdf
+
+# Local Claude Code instructions
+CLAUDE.md
