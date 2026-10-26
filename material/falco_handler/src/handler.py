@@ -5,13 +5,14 @@ from datetime import datetime, timezone
 import hmac
 import logging
 import os
-import re
 import threading
-from typing import Mapping, Optional, Set
+import time
+from typing import Callable, Mapping, Optional, Set
 
 from flask import Flask, jsonify, request
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
+from urllib3.exceptions import HTTPError as TransportError
 
 
 DEFAULT_ALLOWED_RULES = (
@@ -23,6 +24,12 @@ MANAGER_LABEL = "security-lab/managed-by"
 MANAGER = "falco-handler"
 QUARANTINED_AT = "security-lab/quarantined-at"
 EVIDENCE_EXPORTED = "security-lab/evidence-exported"
+
+# Falcosidekick sends each alert once and never retries, so transient API failures
+# must be absorbed here. 409 means the pod changed between read and patch.
+API_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 0.2
+RETRYABLE_STATUSES = {409, 429, 500, 502, 503, 504}
 
 
 def _csv_set(value: str) -> Set[str]:
@@ -39,6 +46,7 @@ class Settings:
     detach_label_keys: Set[str]
     max_quarantined_pods: int
     request_timeout_seconds: float
+    lock_wait_seconds: float
     pod_name: str
     pod_namespace: str
 
@@ -54,6 +62,9 @@ class Settings:
         timeout = float(environ.get("K8S_REQUEST_TIMEOUT_SECONDS", "3"))
         if not 0 < timeout <= 10:
             raise ValueError("K8S_REQUEST_TIMEOUT_SECONDS must be in (0, 10]")
+        lock_wait = float(environ.get("LOCK_WAIT_SECONDS", "10"))
+        if not 0 < lock_wait <= 30:
+            raise ValueError("LOCK_WAIT_SECONDS must be in (0, 30]")
 
         return cls(
             webhook_token=token,
@@ -66,6 +77,7 @@ class Settings:
             ),
             max_quarantined_pods=max_quarantined,
             request_timeout_seconds=timeout,
+            lock_wait_seconds=lock_wait,
             pod_name=environ.get("POD_NAME", "").strip(),
             pod_namespace=environ.get("POD_NAMESPACE", "default").strip(),
         )
@@ -80,15 +92,22 @@ def _resolve_workload(data: dict) -> tuple[Optional[str], Optional[str]]:
     namespace = output_fields.get("k8s.ns.name")
     if pod and namespace:
         return str(pod), str(namespace)
+    return None, None
 
-    # CRI fallback: k8s_<container>_<pod>_<namespace>_<uid>_<restart>
-    container_full_name = str(output_fields.get("container.name") or "")
-    match = re.match(r"k8s_([^_]+)_([^_]+)_([^_]+)_", container_full_name)
-    if not match:
-        return None, None
 
-    _, pod, namespace = match.groups()
-    return pod, namespace
+def _is_transient(exc: Exception) -> bool:
+    if isinstance(exc, ApiException):
+        return exc.status in RETRYABLE_STATUSES
+    return isinstance(exc, TransportError)
+
+
+class _Rejected(Exception):
+    """The event is valid but the target pod must not be touched by this handler."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
 
 
 def _quarantine_time(pod: object):
@@ -103,6 +122,7 @@ def _quarantine_time(pod: object):
 def create_app(
     k8s_api: Optional[client.CoreV1Api] = None,
     environ: Optional[Mapping[str, str]] = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> Flask:
     """Application factory; dependency injection keeps the response logic testable."""
     settings = Settings.from_environ(os.environ if environ is None else environ)
@@ -158,6 +178,9 @@ def create_app(
 
         pod, namespace = _resolve_workload(data)
         if not pod or not namespace:
+            app.logger.warning(
+                "Falco event rule=%s lacks k8s.pod.name/k8s.ns.name output fields; "
+                "check the container plugin or append_output extra_fields", rule)
             return jsonify(error="pod identity is missing"), 400
         if namespace not in settings.allowed_namespaces:
             app.logger.warning("Rejected event for namespace=%s", namespace)
@@ -171,102 +194,143 @@ def create_app(
             namespace,
         )
 
-        if not response_lock.acquire(blocking=False):
-            return jsonify(error="response in progress; retry"), 503
+        # Concurrent alerts wait for their turn: a 503 here is a lost alert because
+        # Falcosidekick does not retry.
+        if not response_lock.acquire(timeout=settings.lock_wait_seconds):
+            app.logger.error("Dropped event for pod=%s: response lock wait exceeded", pod)
+            return jsonify(error="response in progress; event dropped"), 503
         try:
-            target_pod = k8s_api.read_namespaced_pod(
-                name=pod,
-                namespace=namespace,
-                _request_timeout=settings.request_timeout_seconds,
-            )
-            existing_labels = target_pod.metadata.labels or {}
-            already_quarantined = existing_labels.get("tainted-by-falco") == "true"
-            if already_quarantined and existing_labels.get(MANAGER_LABEL) != MANAGER:
-                return jsonify(error="quarantine is not managed by this handler"), 403
+            try:
+                patched_pod, already_quarantined = with_retries(lambda: contain(pod, namespace))
+            except _Rejected as rejection:
+                app.logger.warning("Rejected event for pod=%s: %s", pod, rejection.message)
+                return jsonify(error=rejection.message), rejection.status
+            except (ApiException, TransportError) as exc:
+                if isinstance(exc, ApiException) and exc.status == 404:
+                    app.logger.warning("Target pod=%s namespace=%s no longer exists", pod, namespace)
+                    return jsonify(status="gone", pod=pod, namespace=namespace), 200
+                app.logger.error("Kubernetes API error while quarantining pod=%s: %s", pod, exc)
+                return jsonify(error="Kubernetes API request failed"), 502
 
-            if not already_quarantined and existing_labels.get(settings.target_label_key) != settings.target_label_value:
-                app.logger.warning("Rejected event for non-target pod=%s", pod)
-                return jsonify(error="pod is outside the managed workload"), 403
-
-            # Preserve unrelated metadata. Only selector labels required to detach the
-            # lab workload are removed, and resourceVersion provides conflict detection.
-            patch_labels = {
-                key: None for key in settings.detach_label_keys if key in existing_labels
-            }
-            patch_labels["tainted-by-falco"] = "true"
-            patch_labels[MANAGER_LABEL] = MANAGER
-            patch = {
-                "metadata": {
-                    "resourceVersion": target_pod.metadata.resource_version,
-                    "labels": patch_labels,
-                    "annotations": {QUARANTINED_AT: datetime.now(timezone.utc).isoformat()},
-                }
-            }
-            patched_pod = target_pod if already_quarantined else k8s_api.patch_namespaced_pod(
-                name=pod,
-                namespace=namespace,
-                body=patch,
-                _request_timeout=settings.request_timeout_seconds,
-            )
             if (patched_pod.metadata.labels or {}).get("tainted-by-falco") != "true":
                 raise RuntimeError("Kubernetes API response did not confirm quarantine label")
-
-            # Cleanup happens only after successful containment. Retain a bounded set
-            # of recent forensic pods instead of destroying the previous evidence first.
-            quarantined = k8s_api.list_namespaced_pod(
-                namespace=namespace,
-                label_selector=f"tainted-by-falco=true,{MANAGER_LABEL}={MANAGER}",
-                _request_timeout=settings.request_timeout_seconds,
-            )
-            previous = [item for item in quarantined.items
-                        if item.metadata.name != pod
-                        and (item.metadata.labels or {}).get(MANAGER_LABEL) == MANAGER
-                        and (item.metadata.labels or {}).get("tainted-by-falco") == "true"
-                        and _quarantine_time(item) is not None]
-            previous.sort(key=_quarantine_time, reverse=True)
-            keep_previous = settings.max_quarantined_pods - 1
-            cleanup_pending = False
-            for stale_pod in previous[keep_previous:]:
-                # Never destroy unexported evidence automatically. This is a soft
-                # retention target, not a hard resource cap or a forensic exporter.
-                if (getattr(stale_pod.metadata, "annotations", None) or {}).get(EVIDENCE_EXPORTED) != "true":
-                    app.logger.warning("Retaining unexported evidence pod=%s", stale_pod.metadata.name)
-                    continue
-                try:
-                    k8s_api.delete_namespaced_pod(
-                        name=stale_pod.metadata.name,
-                        namespace=namespace,
-                        body=client.V1DeleteOptions(
-                            grace_period_seconds=30,
-                            preconditions=client.V1Preconditions(
-                                uid=stale_pod.metadata.uid,
-                                resource_version=stale_pod.metadata.resource_version),
-                        ),
-                        _request_timeout=settings.request_timeout_seconds,
-                    )
-                    app.logger.info("Deleted expired forensic pod=%s", stale_pod.metadata.name)
-                except ApiException as exc:
-                    if exc.status == 404:
-                        continue
-                    cleanup_pending = True
-                    app.logger.error(
-                        "Quarantine succeeded but retention cleanup failed for pod=%s: %s",
-                        stale_pod.metadata.name,
-                        exc,
-                    )
-
-            if cleanup_pending:
-                return jsonify(status="quarantined", cleanup="retry-required"), 503
             app.logger.info("Quarantine label confirmed pod=%s namespace=%s", pod, namespace)
-            return jsonify(status="already-quarantined" if already_quarantined else "quarantined",
-                           pod=pod, namespace=namespace), 200
-        except ApiException as exc:
-            app.logger.error("Kubernetes API error while quarantining pod=%s: %s", pod, exc)
-            return jsonify(error="Kubernetes API request failed"), 502
+
+            # Cleanup happens only after successful containment, and its failure does
+            # not undo it: the next accepted event retries the cleanup.
+            cleanup_pending = not cleanup(pod, namespace)
+            body = {
+                "status": "already-quarantined" if already_quarantined else "quarantined",
+                "pod": pod,
+                "namespace": namespace,
+            }
+            if cleanup_pending:
+                body["cleanup"] = "pending"
+            return jsonify(body), 200
         except Exception as exc:
             app.logger.exception("Unexpected quarantine error for pod=%s: %s", pod, exc)
             return jsonify(error="quarantine failed"), 500
         finally:
             response_lock.release()
+
+    def with_retries(operation):
+        for attempt in range(1, API_ATTEMPTS + 1):
+            try:
+                return operation()
+            except (ApiException, TransportError) as exc:
+                if attempt == API_ATTEMPTS or not _is_transient(exc):
+                    raise
+                app.logger.warning(
+                    "Transient Kubernetes API error (attempt %d/%d): %s", attempt, API_ATTEMPTS, exc)
+                sleep(RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1))
+
+    def contain(pod: str, namespace: str):
+        """Read, validate and label the target; each retry starts from a fresh read."""
+        target_pod = k8s_api.read_namespaced_pod(
+            name=pod,
+            namespace=namespace,
+            _request_timeout=settings.request_timeout_seconds,
+        )
+        existing_labels = target_pod.metadata.labels or {}
+        if existing_labels.get("tainted-by-falco") == "true":
+            if existing_labels.get(MANAGER_LABEL) != MANAGER:
+                raise _Rejected(403, "quarantine is not managed by this handler")
+            return target_pod, True
+        if existing_labels.get(settings.target_label_key) != settings.target_label_value:
+            raise _Rejected(403, "pod is outside the managed workload")
+
+        # Preserve unrelated metadata. Only selector labels required to detach the
+        # lab workload are removed, and resourceVersion provides conflict detection.
+        patch_labels = {
+            key: None for key in settings.detach_label_keys if key in existing_labels
+        }
+        patch_labels["tainted-by-falco"] = "true"
+        patch_labels[MANAGER_LABEL] = MANAGER
+        patch = {
+            "metadata": {
+                "resourceVersion": target_pod.metadata.resource_version,
+                "labels": patch_labels,
+                "annotations": {QUARANTINED_AT: datetime.now(timezone.utc).isoformat()},
+            }
+        }
+        patched_pod = k8s_api.patch_namespaced_pod(
+            name=pod,
+            namespace=namespace,
+            body=patch,
+            _request_timeout=settings.request_timeout_seconds,
+        )
+        return patched_pod, False
+
+    def cleanup(pod: str, namespace: str) -> bool:
+        """Retain a bounded set of recent forensic pods; returns False if work remains."""
+        try:
+            quarantined = with_retries(lambda: k8s_api.list_namespaced_pod(
+                namespace=namespace,
+                label_selector=f"tainted-by-falco=true,{MANAGER_LABEL}={MANAGER}",
+                _request_timeout=settings.request_timeout_seconds,
+            ))
+        except (ApiException, TransportError) as exc:
+            app.logger.error("Quarantine succeeded but listing for cleanup failed: %s", exc)
+            return False
+
+        previous = [item for item in quarantined.items
+                    if item.metadata.name != pod
+                    and (item.metadata.labels or {}).get(MANAGER_LABEL) == MANAGER
+                    and (item.metadata.labels or {}).get("tainted-by-falco") == "true"
+                    and _quarantine_time(item) is not None]
+        previous.sort(key=_quarantine_time, reverse=True)
+        keep_previous = settings.max_quarantined_pods - 1
+        complete = True
+        for stale_pod in previous[keep_previous:]:
+            # Never destroy unexported evidence automatically. This is a soft
+            # retention target, not a hard resource cap or a forensic exporter.
+            if (getattr(stale_pod.metadata, "annotations", None) or {}).get(EVIDENCE_EXPORTED) != "true":
+                app.logger.warning("Retaining unexported evidence pod=%s", stale_pod.metadata.name)
+                continue
+            try:
+                # No retry here: a 409 means the preconditions no longer hold, and the
+                # next accepted event re-lists and re-evaluates the pod anyway.
+                k8s_api.delete_namespaced_pod(
+                    name=stale_pod.metadata.name,
+                    namespace=namespace,
+                    body=client.V1DeleteOptions(
+                        grace_period_seconds=30,
+                        preconditions=client.V1Preconditions(
+                            uid=stale_pod.metadata.uid,
+                            resource_version=stale_pod.metadata.resource_version),
+                    ),
+                    _request_timeout=settings.request_timeout_seconds,
+                )
+                app.logger.info("Deleted expired forensic pod=%s", stale_pod.metadata.name)
+            except (ApiException, TransportError) as exc:
+                if isinstance(exc, ApiException) and exc.status == 404:
+                    continue
+                complete = False
+                app.logger.error(
+                    "Quarantine succeeded but retention cleanup failed for pod=%s: %s",
+                    stale_pod.metadata.name,
+                    exc,
+                )
+        return complete
 
     return app
