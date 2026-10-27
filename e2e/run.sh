@@ -186,11 +186,13 @@ log "Installing Cilium ${CILIUM_VERSION} as the CNI"
 helm repo add cilium https://helm.cilium.io >/dev/null
 helm repo update cilium >/dev/null
 # Minimal kind-friendly install: kube-proxy is left in place (so the NodePort
-# keeps working) and IPAM is delegated to Kubernetes.
+# keeps working) and IPAM is delegated to Kubernetes. The operator runs one
+# replica: its pod anti-affinity keeps a second one Pending on a single node.
 helm upgrade --install cilium cilium/cilium --version "$CILIUM_VERSION" \
   --namespace kube-system \
   --set image.pullPolicy=IfNotPresent \
   --set ipam.mode=kubernetes \
+  --set operator.replicas=1 \
   --wait --timeout 5m
 kubectl -n kube-system rollout status ds/cilium --timeout=180s
 kubectl -n kube-system rollout status deploy/cilium-operator --timeout=180s
