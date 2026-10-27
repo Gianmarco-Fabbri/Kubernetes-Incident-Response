@@ -63,6 +63,8 @@ dump_diagnostics() {
     kubectl -n default logs deploy/falco-handler --tail=200 || true
     echo "### cilium status ###"
     kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg status --brief || true
+    echo "### cilium endpoints (identity labels, policy enforcement) ###"
+    kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg endpoint list || true
     echo "### recent events ###"
     kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -60 || true
   } >&2
@@ -292,19 +294,20 @@ HEALTHY_POD="$(healthy_pod_name)"
 HEALTHY_IP="$(pod_ip "$HEALTHY_POD")"
 LISTENER_IP="$(pod_ip listener)"
 
+# Cilium enforces the deny policy only once the relabelled pod has a new
+# security identity, which takes a few seconds, so poll before failing.
+tainted_egress_blocked()  { ! tcp_from_vulnapp "$TAINTED_POD" "$LISTENER_IP" 4444; }
+tainted_ingress_blocked() { ! tcp_from_listener "$TAINTED_IP" 8080; }
+
 # egress: tainted pod must not reach the listener; a healthy pod must.
-if tcp_from_vulnapp "$TAINTED_POD" "$LISTENER_IP" 4444; then
-  fail "quarantined pod reached the listener (egress not blocked)"
-fi
+wait_for "egress from quarantined pod blocked" 60 3 tainted_egress_blocked
 ok "egress from quarantined pod to listener is blocked"
 wait_for "healthy pod can reach listener" 60 3 \
   tcp_from_vulnapp "$HEALTHY_POD" "$LISTENER_IP" 4444
 ok "egress from a healthy pod to the listener works"
 
 # ingress: listener must not reach the tainted pod; it must reach a healthy one.
-if tcp_from_listener "$TAINTED_IP" 8080; then
-  fail "listener reached the quarantined pod on :8080 (ingress not blocked)"
-fi
+wait_for "ingress to quarantined pod blocked" 60 3 tainted_ingress_blocked
 ok "ingress from listener to quarantined pod :8080 is blocked"
 wait_for "listener can reach a healthy pod" 60 3 \
   tcp_from_listener "$HEALTHY_IP" 8080
