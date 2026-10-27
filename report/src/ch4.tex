@@ -98,18 +98,33 @@ The following checks were completed for the current implementation:
 \begin{itemize}
 \item Twenty-two handler regression tests pass in a hardened Python 3.11 container,
 running non-root with a read-only filesystem and no network access, on every push.
-\item Both container images built successfully; the target form and a loopback ping
-request passed a basic smoke test.
-\item Helm chart 9.1.0 rendered successfully; the webhook header and policy-selector
-labels were checked in the generated resources.
-\item Standard Kubernetes manifests passed server-side dry-run on Kubernetes
-v1.35.6+orb1, without creating deployment resources.
+\item Both container images are built in CI; the target form and a loopback ping
+request pass a smoke test without network access.
+\item Helm chart 9.1.0 is rendered in CI; the webhook header, the policy-selector
+labels and the pod/namespace output fields are checked in the generated resources.
+\item Every manifest, including the \texttt{CiliumNetworkPolicy}, is validated
+against its schema with \texttt{kubeconform}.
 \end{itemize}
-These checks do not validate the Cilium custom resource or live packet enforcement.
-End-to-end testing must additionally verify real Falco event identity, unauthorized
-sender rejection, Service detachment, replacement readiness, bidirectional network
-deny and behaviour under retries or bursts. Measure service errors and latency rather
-than asserting zero downtime. The repository README contains the integration checklist.
+
+An end-to-end test (\texttt{e2e/run.sh}) creates a single-node kind cluster with
+Cilium~1.20.4, installs Falco~0.44.1 and the handler with the commands of the
+README, and attacks the target. Its first passing run, on 27 October 2026, showed:
+\begin{itemize}
+\item the reverse shell is detected by Falco with the pod and namespace fields, and
+exactly the compromised pod is relabelled;
+\item the tainted pod leaves the EndpointSlices and two ready replicas are restored;
+\item the quarantined pod can neither open TCP connections nor receive them on its
+application port, while a healthy replica can;
+\item the \texttt{ptrace} payload quarantines a second pod;
+\item an unrelated pod cannot reach the handler, and a webhook call without the token
+is rejected with HTTP~401.
+\end{itemize}
+The test does not cover UDP/DNS, ICMP or established connections, bursts of events,
+handler upgrades or a multi-node cluster, and it does not exercise the custom
+network-tools rule: on kind, images loaded with \texttt{kind load} carry a generated
+repository name, so rules that match \texttt{container.image.repository} do not apply.
+Measure service errors and latency rather than asserting zero downtime. The repository
+README contains the checklist for a fuller validation.
 
 Before cleanup, list quarantined pods, collect required evidence, and delete explicitly
 identified compromised pods. Do not remove the isolation policy while compromised
@@ -128,8 +143,8 @@ never deletes evidence that an operator has not marked as exported.
 The main limitations are delivery and trust. Alerts are not persisted, so a handler
 outage loses them; the webhook token travels over plain HTTP inside the cluster;
 and administrators, node access and label editors remain trusted. The handler does
-not acquire memory or export evidence, and containment must still be measured on a
-real Cilium cluster rather than inferred from accepted label changes.
+not acquire memory or export evidence, and containment has been measured only on a
+single-node kind cluster and for TCP.
 
 Natural extensions follow from these limits:
 \begin{itemize}
@@ -139,6 +154,7 @@ such as NATS or Kafka that the handler consumes and acknowledges;
 the handler;
 \item evidence acquisition before or right after isolation, for example through
 the kubelet container checkpoint API, with the result recorded on the pod;
-\item an automated end-to-end test on a disposable cluster that exercises each
-detection scenario and verifies bidirectional network deny.
+\item a wider end-to-end test: a multi-node cluster, UDP, ICMP and established
+connections, bursts of events, and the custom rule with images that keep their
+repository name.
 \end{itemize}

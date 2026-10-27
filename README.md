@@ -1,6 +1,7 @@
 # Kubernetes Runtime Security & Incident Response Lab
 
 [![CI](https://github.com/Gianmarco-Fabbri/Kubernetes-Incident-Response/actions/workflows/ci.yml/badge.svg)](https://github.com/Gianmarco-Fabbri/Kubernetes-Incident-Response/actions/workflows/ci.yml)
+[![E2E](https://github.com/Gianmarco-Fabbri/Kubernetes-Incident-Response/actions/workflows/e2e.yml/badge.svg)](https://github.com/Gianmarco-Fabbri/Kubernetes-Incident-Response/actions/workflows/e2e.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A hands-on lab that detects malicious activity inside a Kubernetes pod at runtime and
@@ -74,6 +75,8 @@ not a detection guaranteed by this ruleset.
 | [`material/manifests/`](material/manifests) | Target Deployment, Service, PDB and Cilium quarantine policy |
 | [`material/vulnapp/`](material/vulnapp) | Deliberately vulnerable Flask target |
 | [`material/payloads/`](material/payloads) | Linux `ptrace` anti-debugging demonstration |
+| [`e2e/`](e2e) | End-to-end test on kind: cluster config, attacker listener, driver script |
+| [`.github/workflows/`](.github/workflows) | CI (tests, image builds, manifest checks) and the E2E workflow |
 | [`report/`](report) | LaTeX sources of the technical report |
 
 ## Quickstart
@@ -159,24 +162,59 @@ PYTHONPATH=material/falco_handler/src .venv/bin/python -m unittest discover \
   -s material/falco_handler/tests -v
 ```
 
+### End-to-end test
+
+[`e2e/run.sh`](e2e/run.sh) creates a disposable single-node kind cluster, installs
+Cilium and the whole chain with the Quickstart commands, then attacks the target and
+checks the response. It needs `docker`, `kind`, `kubectl`, `helm`, `openssl` and
+`curl`, and takes a few minutes:
+
+```bash
+bash e2e/run.sh
+```
+
+The cluster is deleted at the end. Set `KEEP_CLUSTER=1` to keep it for inspection
+and `REUSE_CLUSTER=1` to run again on an existing one; `CILIUM_VERSION` and
+`FALCO_CHART_VERSION` override the pinned versions. On failure the script prints the
+Falco, Falcosidekick, handler and Cilium logs.
+
 ## Validation status
 
-[GitHub Actions](.github/workflows/ci.yml) runs on every push and pull request:
-handler unit tests (Python 3.11, on the runner and inside the non-root, read-only,
-network-less handler image), Python compilation, YAML parsing of all manifests and
-both container builds.
+[CI](.github/workflows/ci.yml) runs on every push and pull request:
 
-The following checks were executed manually on 19 September 2026:
+- handler unit tests (Python 3.11, on the runner and inside the non-root, read-only,
+  network-less handler image), Python compilation and YAML parsing of all manifests;
+- both container builds and a smoke test of the target with `--network none`
+  (form GET and loopback ping POST);
+- a render of the Falco chart 9.1.0, checking the `X-Falco-Token` header, the labels
+  the two NetworkPolicies select on and the pod/namespace output fields;
+- `kubeconform` on every manifest, `CiliumNetworkPolicy` included.
+
+The [E2E workflow](.github/workflows/e2e.yml) runs `e2e/run.sh` when `material/` or
+`e2e/` change on `main`, once a week and on demand. The first green run was on
+27 October 2026 ([run](https://github.com/Gianmarco-Fabbri/Kubernetes-Incident-Response/actions/runs/40488210139)),
+with kind v0.33.0 (Kubernetes v1.37.0), kernel 6.17 on the GitHub runner,
+Cilium 1.20.4, Falco 0.44.1 (chart 9.1.0, `falco-rules:5`, container plugin 0.7.1)
+and Falcosidekick 2.32.0.
 
 | Check | Result |
 |---|---|
-| Target smoke test | Form GET and loopback ping POST passed without external network access |
-| Helm rendering | Chart 9.1.0 rendered; webhook header and policy selector labels checked |
-| Kubernetes standard manifests | Server-side dry-run passed on Kubernetes v1.35.6+orb1; no resources created |
-| Cilium isolation / complete Falco response chain | **Not yet validated end-to-end** |
+| Reverse shell via command injection | Detected; exactly one pod quarantined, `app` label removed |
+| Service and ReplicaSet | Tainted IP left the EndpointSlices; two ready replicas restored |
+| Cilium isolation (TCP) | Quarantined pod cannot connect out or be reached on `:8080`; healthy pods can |
+| `ptrace` anti-debugging payload | Detected; a second pod quarantined, replicas restored |
+| Handler exposure | Unrelated pod cannot reach the handler; unauthenticated webhook gets 401 |
+| Custom rule `Detect Network Tools in vulnapp` | **Not exercised** (see below) |
+| UDP/DNS, ICMP, established connections, bursts, upgrades | **Not tested** |
+
+The E2E runs on a single-node kind cluster, not on a multi-node or production-like
+cluster. On kind, images loaded with `kind load` are reported by Falco with a
+generated repository name (`import-<date>`) instead of `vulnapp`, so the custom rule
+and the `falco-handler` macro, which match on `container.image.repository`, would
+not apply there.
 
 <details>
-<summary>End-to-end checklist for a disposable Cilium cluster</summary>
+<summary>Checklist for a fuller validation on a disposable Cilium cluster</summary>
 
 1. Record Kubernetes, kernel, runtime, chart, ruleset and image versions. Check that
    Falco starts without duplicate rules and emits pod/namespace fields.

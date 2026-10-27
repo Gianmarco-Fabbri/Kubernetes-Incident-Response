@@ -76,10 +76,11 @@ reconciliation and failure recovery must be measured in the deployment environme
 The response handler, deployment hardening, network-policy manifests and automated
 tests are implemented. Twenty-two regression tests run on every push in the Python
 3.11 handler image under non-root, read-only and network-disabled execution. Both container
-images were built, Helm output was inspected, and standard Kubernetes manifests
-passed server-side dry-run validation.
+images are built and smoke-tested, the Falco chart is rendered and checked, and all
+manifests are validated against their schemas.
 
-\textbf{End-to-end Falco-to-Cilium containment remains unverified for this revision.}
-The available validation environment did not include Cilium. Detection scenarios
-in Chapter~\ref{ch:ch3} specify reproducible procedures and acceptance criteria,
-not a claim that the complete chain has already passed those checks.
+An automated end-to-end test runs the complete Falco-to-Cilium chain on a disposable
+single-node kind cluster. Since 27 October 2026 it passes for the reverse-shell and
+\texttt{ptrace} scenarios, including TCP isolation in both directions. It does not
+replace validation on a multi-node cluster, and Chapter~\ref{ch:ch4} lists what it
+does not cover.
