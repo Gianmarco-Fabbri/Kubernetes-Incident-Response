@@ -1,0 +1,35 @@
+name: E2E
+
+# The end-to-end test stands up a kind cluster with Cilium, Falco and the
+# handler, then drives the real attack scenarios. It takes ~10-15 minutes, so
+# it does not run on every push: only on demand, when material/ or e2e/ change
+# on main, and once a week to catch upstream (chart/image) drift.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "material/**"
+      - "e2e/**"
+      - ".github/workflows/e2e.yml"
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          install_only: true
+      - uses: azure/setup-helm@v4
+        with:
+          version: "v3.16.4"
+      - name: Run the end-to-end test
+        run: bash e2e/run.sh

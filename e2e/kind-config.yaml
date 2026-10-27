@@ -1,0 +1,17 @@
+# kind cluster for the end-to-end test.
+#
+# The default CNI is disabled so Cilium can be installed as the CNI: the
+# CiliumNetworkPolicy that quarantines tainted pods only takes effect when
+# Cilium owns the dataplane. NodePort 32080 (the vulnapp Service) is mapped to
+# the host so the command-injection request can reach the target from the
+# runner, exactly as on a real node.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 32080
+        hostPort: 32080
+        protocol: TCP

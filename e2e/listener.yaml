@@ -1,0 +1,42 @@
+# A busybox listener that plays the role of the attacker's collector.
+#
+# It holds a TCP port open with `nc -lk` so the reverse-shell payload has
+# somewhere to connect back to, and it is also used to probe the quarantined
+# pod from the outside (listener -> podIP:8080). It is deliberately NOT labelled
+# app=vulnapp, so the CiliumNetworkPolicy and the handler never touch it.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: listener
+  namespace: default
+  labels:
+    app: listener
+spec:
+  containers:
+    - name: listener
+      image: busybox:1.37
+      # -k keeps listening after each connection closes; the lab only needs the
+      # connection attempt to show up as traffic, not a real shell session.
+      command: ["nc", "-lk", "-p", "4444"]
+      ports:
+        - containerPort: 4444
+      resources:
+        requests:
+          cpu: "10m"
+          memory: "16Mi"
+        limits:
+          cpu: "100m"
+          memory: "64Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: listener
+  namespace: default
+spec:
+  selector:
+    app: listener
+  ports:
+    - protocol: TCP
+      port: 4444
+      targetPort: 4444

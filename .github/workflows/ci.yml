@@ -44,3 +44,147 @@ jobs:
             -e PYTHONPATH=/app falco-handler:ci python -m unittest discover -s /tests -v
       - name: Build lab target image
         run: docker build -t vulnapp:ci material/vulnapp
+      - name: Smoke-test lab target image
+        run: |
+          # The target only needs loopback: --network none proves it pings 127.0.0.1
+          # without any external access, matching how the lab exercises it.
+          docker run -d --rm --name vulnapp-smoke --network none vulnapp:ci
+          trap 'docker rm -f vulnapp-smoke >/dev/null 2>&1 || true' EXIT
+          docker exec -i vulnapp-smoke python - <<'PY'
+          import sys, time, urllib.parse, urllib.request
+
+          base = "http://127.0.0.1:8080/"
+
+          # Wait for Flask to come up inside the container.
+          for _ in range(30):
+              try:
+                  with urllib.request.urlopen(base, timeout=2) as resp:
+                      if resp.status == 200:
+                          break
+              except Exception:
+                  time.sleep(1)
+          else:
+              sys.exit("target did not become ready on loopback")
+
+          with urllib.request.urlopen(base, timeout=5) as resp:
+              assert resp.status == 200, f"GET / returned {resp.status}"
+              assert b"NetDiag" in resp.read(), "GET / body is not the NetDiag page"
+          print("GET / -> 200")
+
+          body = urllib.parse.urlencode({"host": "127.0.0.1"}).encode()
+          with urllib.request.urlopen(base, data=body, timeout=15) as resp:
+              assert resp.status == 200, f"POST / returned {resp.status}"
+              out = resp.read().decode("utf-8", "replace")
+          if "0% packet loss" not in out and "bytes from 127.0.0.1" not in out:
+              sys.exit("ping of 127.0.0.1 did not succeed:\n" + out)
+          print("POST host=127.0.0.1 -> ping succeeded on loopback")
+          PY
+
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install PyYAML
+        run: pip install "pyyaml==6.0.2"
+      - uses: azure/setup-helm@v4
+        with:
+          version: "v3.16.4"
+      - name: Render the Falco chart and check the cross-file contracts
+        run: |
+          set -euo pipefail
+          helm repo add falcosecurity https://falcosecurity.github.io/charts
+          helm repo update falcosecurity
+          work="$(mktemp -d)"
+          # The token is a throwaway: this step only renders, it never deploys.
+          sed 's/CHANGE_ME/ci-dummy-token/' \
+            material/falco/falco-values.example.yaml > "$work/values.yaml"
+          helm template falco falcosecurity/falco --version 9.1.0 \
+            -n falco -f "$work/values.yaml" > "$work/rendered.yaml"
+          RENDERED="$work/rendered.yaml" python - <<'PY'
+          import base64, os, sys
+          import yaml
+
+          docs = [d for d in yaml.safe_load_all(open(os.environ["RENDERED"])) if d]
+
+          # 1. The webhook must carry the X-Falco-Token header the handler checks.
+          #    Falcosidekick stores custom headers base64-encoded in its Secret.
+          headers = None
+          for d in docs:
+              if d.get("kind") == "Secret" and "WEBHOOK_CUSTOMHEADERS" in (d.get("data") or {}):
+                  headers = base64.b64decode(d["data"]["WEBHOOK_CUSTOMHEADERS"]).decode()
+          assert headers is not None, "WEBHOOK_CUSTOMHEADERS not found in rendered Secret"
+          assert headers == "X-Falco-Token:ci-dummy-token", f"unexpected webhook header: {headers!r}"
+          print(f"webhook header present: {headers}")
+
+          # 2. Rendered pods must carry the labels the two NetworkPolicies select on
+          #    (material/falco/falcosidekick-networkpolicy.yaml and
+          #     material/falco_handler/falco-handler-networkpolicy.yaml).
+          def pod_labels(kind):
+              out = []
+              for d in docs:
+                  if d.get("kind") != kind:
+                      continue
+                  tmpl = d.get("spec", {}).get("template", {})
+                  out.append((tmpl.get("metadata", {}) or {}).get("labels", {}) or {})
+              return out
+
+          names = {
+              lbl.get("app.kubernetes.io/name")
+              for lbl in pod_labels("DaemonSet") + pod_labels("Deployment")
+          }
+          for required in ("falco", "falcosidekick"):
+              assert required in names, (
+                  f"no rendered pod has app.kubernetes.io/name={required}; "
+                  "NetworkPolicy selectors would not match"
+              )
+          print("policy selector labels present: falco, falcosidekick")
+
+          # 3. The handler needs k8s.pod.name / k8s.ns.name in the Falco output,
+          #    which the container plugin supplies through suggested_output. If a
+          #    future values change drops it, the handler would reject every event.
+          falco_cfg = None
+          for d in docs:
+              if d.get("kind") == "ConfigMap" and "falco.yaml" in (d.get("data") or {}):
+                  falco_cfg = yaml.safe_load(d["data"]["falco.yaml"])
+          assert falco_cfg is not None, "falco.yaml ConfigMap not found in render"
+          append = falco_cfg.get("append_output") or []
+          suggested = any(
+              isinstance(e, dict) and e.get("suggested_output") is True for e in append
+          )
+          extra = any(
+              isinstance(e, dict)
+              and {"k8s.pod.name", "k8s.ns.name"} <= set(e.get("extra_fields") or [])
+              for e in append
+          )
+          assert suggested or extra, (
+              "Falco append_output provides neither suggested_output nor "
+              "extra_fields with k8s.pod.name/k8s.ns.name; the handler cannot "
+              "resolve the target pod"
+          )
+          print("k8s pod/namespace output fields are provided via append_output")
+          PY
+
+      - name: Install kubeconform
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            "https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+      - name: Validate manifests with kubeconform
+        run: |
+          set -euo pipefail
+          # The CiliumNetworkPolicy CRD schema comes from the datree CRDs-catalog.
+          # The Falco values file is Helm input, not a manifest, so it is ignored.
+          kubeconform \
+            -strict \
+            -summary \
+            -verbose \
+            -kubernetes-version 1.31.0 \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            -ignore-filename-pattern 'falco-values.example.yaml' \
+            material/
