@@ -1,4 +1,4 @@
-# Kubernetes Runtime Security & Incident Response Lab
+# Kubernetes Automated Incident Response
 
 [![CI](https://github.com/Gianmarco-Fabbri/Kubernetes-Incident-Response/actions/workflows/ci.yml/badge.svg)](https://github.com/Gianmarco-Fabbri/Kubernetes-Incident-Response/actions/workflows/ci.yml)
 [![E2E](https://github.com/Gianmarco-Fabbri/Kubernetes-Incident-Response/actions/workflows/e2e.yml/badge.svg)](https://github.com/Gianmarco-Fabbri/Kubernetes-Incident-Response/actions/workflows/e2e.yml)
